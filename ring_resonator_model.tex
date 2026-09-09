@@ -1,0 +1,446 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{teal},
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  xleftmargin=1.5em,
+}
+
+\title{Microstrip Ring Resonator on Polyimide:\\
+Model Development and Modification Guide}
+\author{openEMS Ring Resonator Dk/Loss Extraction Model}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Purpose}
+
+This document describes the openEMS/CSXCAD full-wave FDTD model implemented
+in \texttt{07\_ring\_resonator\_polyimide\_dk\_loss.py}. The model simulates a
+microstrip ring resonator, weakly gap-coupled to a single straight through
+feed line, fabricated on a thin polyimide substrate. A single wideband
+Gaussian excitation spanning 100~MHz--67~GHz is used so that every harmonic
+resonance of the ring appears as a notch in the transmitted S-parameter
+\(|S_{21}|\). From the measured resonant frequencies, $-3$~dB bandwidths, and
+insertion losses, the script extracts the substrate's relative permittivity
+(Dk) and loss tangent ($\tan\delta$) as a function of frequency --- the
+classic \emph{ring-resonator method} used for microwave/mm-wave laminate
+characterization.
+
+This is a practical, general-purpose starting point: the same script
+structure can be adapted to other substrates, stack-ups, and ring/feed
+geometries by editing a small number of parameters near the top of the file,
+as described in Section~\ref{sec:modifying}.
+
+\section{Model Development History}
+
+The model went through several rounds of debugging before it converged on
+physically correct S-parameters. These are documented here because the
+underlying causes are generic FDTD/microstrip modeling pitfalls that are
+easy to reintroduce when the geometry or substrate stack is modified --
+Section~\ref{sec:modifying} calls out where each rule must be respected
+again.
+
+\begin{enumerate}[leftmargin=*]
+
+\item \textbf{Absorbing boundary choice.} The \texttt{MUR} boundary
+condition was found to be numerically unstable (unbounded exponential
+energy growth) for this broadband (100~MHz--67~GHz) case, especially in
+combination with a PEC ground plane sitting exactly on the \texttt{zmin}
+domain boundary. The fix was to use \texttt{PML\_8} on all open boundaries
+and \texttt{PEC} only on the \texttt{zmin} face (where the ground plane
+already terminates the field):
+\begin{lstlisting}[language=Python]
+FDTD.SetBoundaryCond(["PML_8","PML_8","PML_8","PML_8","PEC","PML_8"])
+\end{lstlisting}
+
+\item \textbf{Port margin.} A lumped port's current probe measures a closed
+H-field loop that needs a valid FDTD cell on \emph{both} sides of the probe.
+A port placed exactly on the outermost mesh line of the simulation domain
+has no cell on its outward side, so the measured current is pure numerical
+noise, corrupting $S_{11}$/$S_{21}$ even though the simulation itself
+remains stable. The substrate and ground plane are extended by a
+\texttt{margin} (1~mm) beyond each port so the ports sit a few cells inside
+the domain.
+
+\item \textbf{Feed line must stop exactly at the port planes.} The
+metal trace must \emph{not} extend into the margin region past $x=0$ or
+$x=\texttt{sub\_l}$: a continuous metal sheet running straight over a lumped
+port's vertical probe shorts out the port's series resistor, again causing
+near-total, frequency-independent reflection.
+
+\item \textbf{Open-boundary air gap (z-direction).} Without sufficient air
+space above the trace, the PML/\texttt{zmax} boundary sits right on (or a
+fraction of a millimeter above) the metal, which either silently falls back
+to PEC behavior (too few $z$-lines for a full 8-cell PML) or absorbs the
+near field before it can couple properly. The fix grades the $z$-mesh
+manually above the trace with a geometrically growing sequence (ratio 1.3)
+out to \texttt{z\_air = max(10h, 5w, 1.5)}~mm of clearance.
+
+\item \textbf{Lateral clearance (y-direction).} The same principle applies
+in-plane: the feed line's outer edge must be kept well clear of the
+\texttt{PML\_8} boundary at $y=0$. A microstrip's fringing E-fields extend
+several substrate-heights beyond the trace edge; truncating that too close
+to an absorbing boundary parasitically loads the line (acts like a nearby
+ground wall), severely distorting its characteristic impedance and causing
+large, frequency-independent reflection at \emph{every} frequency --
+including very low ones where a matched line should behave almost ideally.
+The fix introduces
+\begin{lstlisting}[language=Python]
+y_clear = max(10 * h, 5 * w, 0.5)   # [mm] lateral clearance to y=0 boundary
+\end{lstlisting}
+and uses it to size the substrate width and feed-line offset.
+
+\item \textbf{Mesh-line deduplication vs.\ exact port boundaries.} A
+deduplication pass (\texttt{dedupe\_lines}) merges near-coincident mesh
+lines to avoid tiny sliver cells that would otherwise force an unstable CFL
+time step. This can silently merge an exact, manually inserted port-boundary
+line into a nearby fine-grid point, drifting the port's edge away from the
+intended trace edge. The fix re-inserts the exact port-boundary lines
+(\texttt{mesh.AddLine("x", [0, sub\_l])} and the $y$ edges of the feed line)
+\emph{after} the dedup pass.
+
+\item \textbf{Kappa reference frequency.} openEMS's \texttt{kappa} material
+parameter is a plain (frequency-independent) Ohmic conductivity, so the
+\emph{effective} loss tangent it produces scales as
+$\tan\delta_{\mathrm{eff}}(f) = \tan\delta_{\mathrm{nominal}} \cdot
+f_0/f$ -- it is \textbf{not} constant with frequency. Using the excitation's
+arithmetic-mean center frequency as $f_0$ badly overestimates loss at the
+low end of a log-wide band. The fix uses the \emph{geometric} mean of the
+band edges instead:
+\begin{lstlisting}[language=Python]
+f0_kappa = float(np.sqrt(f_start * f_stop))
+kappa = tanD_nominal * 2 * np.pi * f0_kappa * er_nominal * eps0
+\end{lstlisting}
+This minimizes the worst-case log-frequency error across the band but does
+not eliminate it -- see Section~\ref{sec:limitations}.
+
+\item \textbf{Resonance signature: dips, not peaks.} For this single-tap,
+gap-coupled ring topology, each ring resonance couples energy \emph{out of}
+the through line and into the ring, producing a notch (local minimum) in
+$|S_{21}|$ at resonance, not a peak. The post-processing peak finder
+searches for local minima, not maxima.
+
+\item \textbf{Harmonic-index assignment.} The lowest-order ring harmonics
+are the most weakly coupled and can be too shallow to cross the detection
+threshold, especially before the simulation has fully converged. If the
+detected notches were simply numbered $n=1,2,3,\dots$ in ascending frequency
+order, a missing low-order harmonic would silently mislabel every harmonic
+above it. The script instead estimates $n$ directly from the physical
+resonance condition (Eq.~\ref{eq:resonance}) using the nominal effective
+permittivity as an initial guess, then rounds to the nearest integer.
+
+\end{enumerate}
+
+\section{Model Structure}
+
+\subsection{Geometry overview}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Element} & \textbf{Description} \\
+\midrule
+Ground plane & Full-size PEC sheet at $z=0$, covering the substrate footprint (plus margin) \\
+Substrate & Single dielectric slab, thickness $h$, from $z=0$ to $z=h$ \\
+Feed line & Straight microstrip trace of width $w$, thickness $t$, at $z \in [h, h+t]$ \\
+Ring & Cylindrical-shell (annulus) trace, mean radius $r_{\mathrm{mean}}$, width $w$, same $z$ range \\
+Ports & Two lumped 50~$\Omega$ ports, one at each end of the feed line ($z$-directed) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The ring is placed alongside the feed line, separated by a coupling gap
+\texttt{gap}, so that the ring's outer edge is a distance \texttt{gap} from
+the feed line's edge (edge-coupled, not tap-coupled). Only a single feed
+line couples to the ring (a ``one-port-pair, single-tap'' topology): energy
+is launched at port~1, mostly transmitted straight through to port~2, with a
+small fraction resonantly coupled into the ring at each of its harmonic
+frequencies.
+
+\subsection{Key parameters in the script}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Variable} & \textbf{Meaning} & \textbf{Default} \\
+\midrule
+\texttt{f\_start}, \texttt{f\_stop} & Simulation frequency band & 0.1--67~GHz \\
+\texttt{er\_nominal} & Substrate relative permittivity (Dk) & 3.5 \\
+\texttt{tanD\_nominal} & Substrate loss tangent & 0.008 \\
+\texttt{h} & Substrate thickness [mm] & 0.1 \\
+\texttt{w} & Trace width [mm], synthesized for 50~$\Omega$ & (computed) \\
+\texttt{trace\_t} & Copper trace thickness [mm] & 0.017 (0.5~oz) \\
+\texttt{f1\_target} & Target fundamental ring resonance & 8.5~GHz \\
+\texttt{r\_mean} & Ring mean radius [mm] & (computed from \texttt{f1\_target}) \\
+\texttt{gap} & Ring-to-feed-line coupling gap [mm] & 0.12 \\
+\texttt{feed\_len} & Feed stub length each side [mm] & 4.0 \\
+\texttt{margin} & Port/substrate margin past the ports [mm] & 1.0 \\
+\texttt{y\_clear} & Lateral clearance, trace to PML [mm] & $\max(10h, 5w, 0.5)$ \\
+\texttt{z\_air} & Vertical clearance, trace to PML [mm] & $\max(10h, 5w, 1.5)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Trace width synthesis}
+
+The feed-line/ring trace width $w$ is synthesized for a 50~$\Omega$
+characteristic impedance using the closed-form Hammerstad synthesis formula,
+given the substrate's nominal $\varepsilon_r$ and thickness $h$:
+\[
+A = \frac{Z_0}{60}\sqrt{\frac{\varepsilon_r+1}{2}}
+   + \frac{\varepsilon_r - 1}{\varepsilon_r + 1}
+     \left(0.23 + \frac{0.11}{\varepsilon_r}\right), \qquad
+\frac{W}{h} = \frac{8 e^{A}}{e^{2A} - 2} \quad (W/h < 2).
+\]
+This is only valid for the narrow-trace ($W/h < 2$) regime; for thicker
+substrates or higher-Dk materials where the synthesized $W/h \geq 2$, the
+wide-trace Hammerstad formula should be substituted instead (see
+Section~\ref{sec:modifying}).
+
+\subsection{Ring sizing and the resonance condition}
+\label{sec:resonance}
+
+The ring's mean radius is chosen so its fundamental ($n=1$) resonance sits
+near a target frequency \texttt{f1\_target} (default 8.5~GHz), spreading
+roughly seven harmonics across the 100~MHz--67~GHz simulation band. The
+governing relation is the ring's circumferential standing-wave condition:
+\begin{equation}
+n\,\lambda_g(f_n) = 2\pi r_{\mathrm{mean}}
+\quad\Longrightarrow\quad
+\varepsilon_{\mathrm{eff}, n} =
+\left(\frac{n\,c_0}{2\pi r_{\mathrm{mean}} f_n}\right)^{2},
+\label{eq:resonance}
+\end{equation}
+where $c_0$ is the speed of light in vacuum and $f_n$ is the $n$-th measured
+resonant frequency. This same relation, inverted, is used both to size the
+ring initially (given a nominal $\varepsilon_{\mathrm{eff}}$) and to
+recover $\varepsilon_{\mathrm{eff}, n}$ from each measured resonance.
+
+\subsection{Dk and loss-tangent extraction}
+
+For each detected $|S_{21}|$ notch:
+\begin{enumerate}
+\item Determine $f_n$ and its harmonic index $n$ (Eq.~\ref{eq:resonance}).
+\item Compute $\varepsilon_{\mathrm{eff}, n}$ from Eq.~\ref{eq:resonance}.
+\item Invert the Hammerstad--Jensen effective-permittivity relation for the
+known (fixed) trace $W/h$ to recover $\varepsilon_{r,n}$ (Dk):
+\[
+\varepsilon_{\mathrm{eff}} = \frac{\varepsilon_r + 1}{2}
+  + \frac{\varepsilon_r - 1}{2} F(W/h), \qquad
+  F(W/h) = \left(1 + \frac{12}{W/h}\right)^{-1/2}.
+\]
+\item Measure the loaded $Q_L = f_n / \mathrm{BW}_{3\mathrm{dB}}$ from the
+notch's $-3$~dB bandwidth, then the unloaded $Q_u$ via the standard
+insertion-loss correction $Q_u = Q_L / (1 - 10^{-\mathrm{IL_{dB}}/20})$.
+\item Compute an analytic conductor-loss-only $Q_c$ from the Wheeler
+incremental-inductance rule and copper surface resistance, and remove it
+from $Q_u$ to isolate the dielectric-only $Q_d$:
+$1/Q_d = 1/Q_u - 1/Q_c$ (only when $Q_c > Q_u$; otherwise $Q_u$ itself is
+reported as an upper bound on $Q_d$, see Section~\ref{sec:limitations}).
+\item Recover the loss tangent via the dielectric filling factor
+$q = (\varepsilon_{\mathrm{eff}} - 1)/(\varepsilon_r - 1)$:
+\[
+\tan\delta_n = \frac{1}{Q_{d,n}\, q_n}.
+\]
+\end{enumerate}
+
+\section{Limitations and Interpretation Notes}
+\label{sec:limitations}
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Convergence}: The default \texttt{NrTS = 200000} /
+\texttt{EndCriteria = 1e-5} ($-50$~dB) budget may not be reached for a
+genuinely high-$Q$ ring before the timestep budget is exhausted (openEMS
+will print a warning and stop at \texttt{NrTS}). An incompletely decayed
+time-domain signal narrows the apparent resonance linewidth (spectral
+leakage), which \emph{inflates} the apparent $Q_u$ and therefore
+\emph{underestimates} the extracted $\tan\delta$. If the extracted Dk looks
+reasonable but $\tan\delta$ looks too low (or increases smoothly as
+frequency decreases across the band), increase \texttt{NrTS} and/or relax
+\texttt{EndCriteria} slightly and re-run.
+\item \textbf{Frequency-independent kappa}: because openEMS models a
+constant Ohmic conductivity rather than a true frequency-independent
+$\tan\delta$, the simulated substrate loss is only exactly correct at
+$f = f_0\_\mathrm{kappa}$ (the geometric mean of the band) and drifts
+(over- or under-representing the true material loss) away from it. This is
+a modeling compromise, not a bug; it does not need to be "fixed" for
+Dk extraction (which does not depend on kappa), but should be kept in mind
+when interpreting the extracted $\tan\delta$ trend vs.\ frequency.
+\item \textbf{Analytic conductor-loss model}: the built-in $Q_c$ estimate
+is a simplified microstrip attenuation formula, not a full analytic model
+(it ignores edge current crowding, surface roughness, etc.). If $Q_c$ comes
+out lower than the measured $Q_u$ (physically impossible for a clean
+loss-mechanism separation), the script falls back to reporting $Q_u$
+directly, which is a conservative (upper-bound-on-Dk-loss,
+lower-bound-on-actual-$\tan\delta$) estimate rather than a hard failure.
+\end{itemize}
+
+\section{Running the Model}
+
+\begin{lstlisting}[language=bash]
+conda activate openems
+python 07_ring_resonator_polyimide_dk_loss.py
+\end{lstlisting}
+
+Simulation results (port time/frequency-domain data, and the final
+S-parameter/Dk/loss plot \texttt{ring\_resonator\_dk\_loss.png}) are written
+to \texttt{sim\_results/ring\_resonator/}. A full run at the default mesh
+density takes on the order of a few hours of wall-clock time on a modern
+multi-core workstation (roughly 2.8~million FDTD cells, tens of thousands
+of timesteps).
+
+\section{Modifying the Model}
+\label{sec:modifying}
+
+All of the changes below only require editing parameters/geometry near the
+top of \texttt{07\_ring\_resonator\_polyimide\_dk\_loss.py}; the mesh, port,
+and boundary-condition logic further down the file automatically adapts
+(re-derives clearances, resolutions, etc.) from these parameters and does
+not need to be touched for routine changes described here.
+
+\subsection{Changing the dielectric properties}
+
+To model a different substrate material, edit only:
+\begin{lstlisting}[language=Python]
+er_nominal   = 3.5     # relative permittivity (Dk)
+tanD_nominal = 0.008   # loss tangent
+h            = 0.1     # substrate thickness [mm]
+\end{lstlisting}
+Everything else (trace width synthesis, ring sizing, mesh resolution,
+kappa) is automatically recomputed from these three values. If the new
+material's synthesized trace width comes out with $W/h \geq 2$ (thick,
+low-Dk substrates, or very thin high-Dk ones), replace the narrow-trace
+Hammerstad formula (Section~\ref{sec:modifying}, trace-width synthesis)
+with the wide-trace variant:
+\[
+\frac{W}{h} = \frac{2}{\pi}\Big[B - 1 - \ln(2B-1)
+  + \frac{\varepsilon_r - 1}{2\varepsilon_r}
+    \Big(\ln(B-1) + 0.39 - \frac{0.61}{\varepsilon_r}\Big)\Big],
+\qquad B = \frac{377\pi}{2 Z_0 \sqrt{\varepsilon_r}}.
+\]
+
+\subsection{Changing the ring/feed geometry}
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Fundamental resonance frequency}: change \texttt{f1\_target}
+(default 8.5~GHz). The ring radius \texttt{r\_mean} is automatically
+recomputed from Eq.~\ref{eq:resonance} using the nominal
+$\varepsilon_{\mathrm{eff}}$, so the harmonic comb shifts accordingly. Keep
+in mind the number of harmonics visible in the fixed 100~MHz--67~GHz band
+scales roughly as $67\,\mathrm{GHz}/f_1$.
+\item \textbf{Coupling strength}: change \texttt{gap} (default 0.12~mm).
+Smaller gaps couple more strongly (deeper, wider notches, lower loaded
+$Q_L$); larger gaps couple more weakly (shallower notches that may fall
+below the detection threshold, particularly at low frequency -- see
+Section~\ref{sec:limitations}).
+\item \textbf{Feed line length}: change \texttt{feed\_len} (default 4.0~mm
+each side). This mainly affects total simulation domain size/run time and
+has negligible effect on the extracted results as long as it stays large
+enough that the port's near-field has settled before reaching the ring.
+\item \textbf{Trace width / impedance}: the trace width \texttt{w} is
+automatically synthesized for 50~$\Omega$ from \texttt{er\_nominal} and
+\texttt{h}. To target a different characteristic impedance, change
+\texttt{Z0} (default 50.0) before the synthesis block.
+\item \textbf{Copper thickness}: change \texttt{trace\_t} (default
+0.017~mm, i.e. 0.5~oz copper) to model a different copper weight.
+\end{itemize}
+
+Whenever the ring radius, gap, or trace width changes substantially, sanity
+check that the automatically-derived clearances
+(\texttt{y\_clear}, \texttt{z\_air}, \texttt{margin}) are still being applied
+correctly (Section~\ref{sec:modifying} and history items 4 and 5): these are
+all defined as functions of \texttt{h} and \texttt{w}, so they should scale
+appropriately on their own, but always re-inspect the printed geometry
+summary at the start of a run to confirm reasonable values before committing
+to a multi-hour simulation.
+
+\subsection{Adding more substrate layers}
+
+The current model uses a single dielectric slab between the ground plane
+and the trace. To model a multilayer stack-up (e.g., a core + prepreg, or a
+polyimide film laminated to a carrier), replace the single
+\texttt{CSX.AddMaterial("Polyimide", ...)} block with one material and one
+\texttt{AddBox} call per layer, stacked in $z$:
+
+\begin{lstlisting}[language=Python]
+# Example: two-layer substrate (bottom layer + top layer under the trace)
+h1, er1, tanD1 = 0.05, 3.5, 0.008   # bottom layer (polyimide)
+h2, er2, tanD2 = 0.05, 4.2, 0.015   # top layer (e.g. bond-ply/adhesive)
+h = h1 + h2                         # total substrate thickness used everywhere else
+
+kappa1 = tanD1 * 2 * np.pi * f0_kappa * er1 * eps0
+kappa2 = tanD2 * 2 * np.pi * f0_kappa * er2 * eps0
+
+sub1 = CSX.AddMaterial("Polyimide_bottom", epsilon=er1, kappa=kappa1)
+sub1.AddBox(priority=0, start=[-margin, 0, 0], stop=[sub_l + margin, sub_w, h1])
+
+sub2 = CSX.AddMaterial("Polyimide_top", epsilon=er2, kappa=kappa2)
+sub2.AddBox(priority=0, start=[-margin, 0, h1], stop=[sub_l + margin, sub_w, h1 + h2])
+
+# Ground plane, feed line, ring, and ports are unaffected: they already
+# reference z=0 (ground) and z=h..h+trace_t (trace) generically, so as
+# long as `h` above is redefined as the TOTAL stack thickness, no other
+# geometry code needs to change.
+\end{lstlisting}
+
+Important considerations when adding layers:
+\begin{itemize}[leftmargin=*]
+\item \textbf{Effective permittivity synthesis} (trace width, ring sizing,
+$F(W/h)$ inversion) assumes a single homogeneous substrate. For a true
+multilayer stack, either (a) use a weighted/parallel-plate approximate
+$\varepsilon_r$ for the synthesis step only (reasonable when one layer
+dominates the field energy, e.g. a thin bond-ply under a much thicker
+core), or (b) treat \texttt{er\_nominal} in the synthesis formulas as an
+initial guess and rely on the FDTD-measured $\varepsilon_{\mathrm{eff}, n}$
+per layer stack as the authoritative result -- the resonance-based
+extraction in Section~\ref{sec:resonance} works correctly regardless of how
+many dielectric layers are present, since it only depends on the
+\emph{measured} resonant frequencies, not on the analytic synthesis
+formulas used to size the geometry initially.
+\item \textbf{Mesh}: add a $z$-mesh line at every layer interface
+(\texttt{mesh.AddLine("z", [0, h1, h1+h2, ...])}) so each layer boundary is
+resolved exactly; the existing fine-to-coarse grading logic for the
+open-boundary air gap above the trace does not need to change, since it
+already starts counting from \texttt{h + trace\_t}, the top of the (now
+multi-layer) stack.
+\item \textbf{Reporting}: if you want per-layer Dk/loss reported separately
+rather than a single lumped ``Dk'' number, you will need a more detailed
+post-processing model (e.g. conformal-mapping partial-capacitance methods)
+since the ring-resonator method as implemented here only recovers a single
+effective $\varepsilon_r$ per resonance, consistent with a single equivalent
+homogeneous substrate.
+\end{itemize}
+
+\section{File Summary}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{File} & \textbf{Description} \\
+\midrule
+\texttt{07\_ring\_resonator\_polyimide\_dk\_loss.py} & Full model: geometry, mesh, simulation, post-processing \\
+\texttt{sim\_results/ring\_resonator/} & openEMS output directory (port data, plot) \\
+\texttt{ring\_resonator\_dk\_loss.png} & Final S-parameter / extracted Dk / extracted $\tan\delta$ plot \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
